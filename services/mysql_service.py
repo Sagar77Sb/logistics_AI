@@ -1,3 +1,5 @@
+import re
+
 import mysql.connector
 from mysql.connector.pooling import MySQLConnectionPool
 from config import MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
@@ -15,28 +17,61 @@ pool = MySQLConnectionPool(
 def get_connection():
     return pool.get_connection()
 
-def run_select_query(query, params=None):
-    lowered = query.strip().lower()
+# def run_select_query(query, params=None):
+#     lowered = query.strip().lower()
 
-    forbidden = [
-        "insert", "update", "delete", "drop", "alter",
-        "truncate", "create", "replace", "grant", "revoke"
+#     forbidden = [
+#         "insert", "update", "delete", "drop", "alter",
+#         "truncate", "create", "replace", "grant", "revoke"
+#     ]
+
+#     if not lowered.startswith("select"):
+#         raise Exception("Only SELECT queries are allowed")
+
+#     for word in forbidden:
+#         if word in lowered:
+#             raise Exception("Write operations are not allowed")
+
+#     conn = get_connection()
+#     cursor = conn.cursor(dictionary=True)
+
+#     try:
+#         cursor.execute(query, params or ())
+#         rows = cursor.fetchall()
+#         return rows
+#     finally:
+#         cursor.close()
+#         conn.close()
+
+def run_select_query(query, params=None):
+    forbidden_patterns = [
+        r"\binsert\b",
+        r"\bupdate\b",
+        r"\bdelete\b",
+        r"\bdrop\b",
+        r"\balter\b",
+        r"\btruncate\b",
+        r"\bcreate\b",
+        r"\breplace\b",
+        r"\bgrant\b",
+        r"\brevoke\b",
     ]
 
-    if not lowered.startswith("select"):
-        raise Exception("Only SELECT queries are allowed")
+    q = query.strip().lower()
 
-    for word in forbidden:
-        if word in lowered:
-            raise Exception("Write operations are not allowed")
+    if not q.startswith("select"):
+        raise Exception("Only SELECT queries allowed")
+
+    for pattern in forbidden_patterns:
+        if re.search(pattern, q):
+            raise Exception("Write operations not allowed")
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
     try:
         cursor.execute(query, params or ())
-        rows = cursor.fetchall()
-        return rows
+        return cursor.fetchall()
     finally:
         cursor.close()
         conn.close()

@@ -1,244 +1,333 @@
-import re
-from langchain_google_genai import ChatGoogleGenerativeAI
-from services.rag_service import ask_rag
-from services.mcp_mysql_service import (
-    get_customer_by_id,
-    search_customers,
-    get_customer_summary,
-    get_customer_branch_summary,
-    get_route_by_id,
-    get_route_by_cns,
-    search_routes,
-    get_route_summary,
-    get_city_route_summary,
-    get_customer_route_summary,
-    get_top_cost_routes,
-    get_top_distance_routes
-)
+import json
+import inspect
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    temperature=0
-)
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-def extract_number_after_words(message, words):
-    for word in words:
-        pattern = rf"{word}\s*[:#-]?\s*(\d+)"
-        match = re.search(pattern, message, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
+from services.agent_graph import get_agent
+from services.agent_tools import MCP_TOOL_NAMES, RAG_TOOL_NAME
+from services.mcp_mysql_service import search_customers_paginated, search_routes_paginated
+from services.response_utils import error_response, success_response
+
+MAX_AGENT_STEPS = 8
+DEFAULT_PAGE = 1
+DEFAULT_LIMIT = 10
+MAX_LIMIT = 100
+
+PAGINATED_DB_TOOLS = {
+    "search_customers_tool": search_customers_paginated,
+    "search_routes_tool": search_routes_paginated,
+}
+
+
+def _normalize_pagination(page=None, limit=None):
+    page = int(page or DEFAULT_PAGE)
+    limit = int(limit or DEFAULT_LIMIT)
+
+    if page < 1:
+        raise ValueError("page must be greater than or equal to 1")
+
+    if limit < 1 or limit > MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIMIT}")
+
+    return page, limit
+
+
+def _build_agent_message(message, page, limit):
+    return (
+        f"{message}\n\n"
+        f"[Pagination context: when using list/search database tools, "
+        f"you must use page={page} and limit={limit}.]"
+    )
+
+
+def _safe_parse_tool_content(content):
+    if isinstance(content, (dict, list)):
+        return content
+    if not isinstance(content, str):
+        return content
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+
+
+def _extract_tool_trace(messages):
+    tool_call_map = {}
+
+    for message in messages:
+        if isinstance(message, AIMessage) and message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_call_map[tool_call["id"]] = {
+                    "name": tool_call.get("name"),
+                    "args": tool_call.get("args"),
+                }
+
+    tool_results = []
+    tools_used = []
+
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+
+        call_meta = tool_call_map.get(message.tool_call_id, {})
+        tool_name = call_meta.get("name")
+        tool_args = call_meta.get("args")
+
+        if tool_name:
+            tools_used.append(tool_name)
+
+        tool_results.append(
+            {
+                "tool": tool_name,
+                "args": tool_args,
+                "data": _safe_parse_tool_content(message.content),
+            }
+        )
+
+    return tool_results, tools_used
+
+
+def _extract_final_answer(messages):
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and message.content and not message.tool_calls:
+            if isinstance(message.content, str):
+                return message.content
+            if isinstance(message.content, list):
+                text_parts = [
+                    part.get("text", "")
+                    for part in message.content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                return "".join(text_parts).strip()
+    return "I could not generate an answer for this request."
+
+
+def _normalize_database_result(tool_name, tool_args, data):
+    if isinstance(data, dict) and "records" in data and "pagination" in data:
+        return {
+            "tool": tool_name,
+            "filters": data.get("filters") or tool_args or {},
+            "records": data.get("records", []),
+            "pagination": data.get("pagination"),
+            "row_count": data.get("pagination", {}).get("total", len(data.get("records", []))),
+        }
+
+    if isinstance(data, list):
+        return {
+            "tool": tool_name,
+            "filters": tool_args or {},
+            "records": data,
+            "pagination": None,
+            "row_count": len(data),
+        }
+
+    if isinstance(data, dict) and data:
+        return {
+            "tool": tool_name,
+            "filters": tool_args or {},
+            "record": data,
+            "row_count": 1,
+        }
+
+    return {
+        "tool": tool_name,
+        "filters": tool_args or {},
+        "records": [],
+        "row_count": 0,
+    }
+
+
+def _refresh_paginated_database(tool_results, page, limit):
+    for result in reversed(tool_results):
+        tool_name = result.get("tool")
+        search_fn = PAGINATED_DB_TOOLS.get(tool_name)
+        if not search_fn:
+            continue
+
+        args = result.get("args") or {}
+        valid_keys = set(inspect.signature(search_fn).parameters.keys())
+        filtered_args = {
+            key: value
+            for key, value in args.items()
+            if key in valid_keys and key not in {"page", "limit"}
+        }
+        refreshed = search_fn(**filtered_args, page=page, limit=limit)
+        return _normalize_database_result(tool_name, args, refreshed)
+
     return None
 
-def extract_cns(message):
-    match = re.search(r"\bCNS\d+\b", message, re.IGNORECASE)
-    return match.group(0).upper() if match else None
 
-def extract_vehicle_no(message):
-    match = re.search(r"\b[A-Z]{2}\d{2}[A-Z]{2}\d{4}\b", message, re.IGNORECASE)
-    return match.group(0).upper() if match else None
+def _build_list_answer(database, entity_label):
+    pagination = database.get("pagination") or {}
+    records = database.get("records") or []
+    total = pagination.get("total", database.get("row_count", len(records)))
+    page = pagination.get("page", 1)
+    total_pages = pagination.get("total_pages", 1)
 
-def extract_driver_id(message):
-    match = re.search(r"\b(DRV|DVR|TCI|DR)\d{3}\b", message, re.IGNORECASE)
-    return match.group(0).upper() if match else None
-
-def extract_city_pair(message):
-    text = message.lower()
-
-    from_city = None
-    to_city = None
-
-    from_match = re.search(r"from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+)", text)
-    if from_match:
-        from_city = from_match.group(1).strip().title()
-        to_city = from_match.group(2).strip().title()
-
-    return from_city, to_city
-
-def decide_route(message):
-    text = message.lower()
-
-    rag_keywords = [
-        "policy", "sop", "rule", "rules", "process", "procedure",
-        "guideline", "document", "pdf", "manual", "explain",
-        "how to", "what is"
-    ]
-
-    mcp_keywords = [
-        "customer", "route", "routes", "cns", "vehicle", "driver",
-        "cost", "distance", "km", "city", "branch", "domain",
-        "summary", "top", "highest", "lowest", "from", "to"
-    ]
-
-    has_rag = any(word in text for word in rag_keywords)
-    has_mcp = any(word in text for word in mcp_keywords)
-
-    if has_rag and has_mcp:
-        return "both"
-
-    if has_mcp:
-        return "mcp"
-
-    return "rag"
-
-def run_mcp_tools(message):
-    text = message.lower()
-
-    cns_number = extract_cns(message)
-    vehicle_no = extract_vehicle_no(message)
-    driver_id = extract_driver_id(message)
-
-    customer_id = extract_number_after_words(
-        message,
-        ["customer id", "customer", "cust id", "cust"]
+    answer = (
+        f"Found {total} {entity_label}. "
+        f"Showing page {page} of {total_pages} ({len(records)} record(s) on this page)."
     )
 
-    route_id = extract_number_after_words(
-        message,
-        ["route id", "route"]
-    )
+    if pagination.get("has_next"):
+        next_page = pagination.get("next_page", page + 1)
+        answer += (
+            f" Send the same request with \"page\": {next_page} "
+            f"to view the next page."
+        )
 
-    from_city, to_city = extract_city_pair(message)
+    return answer
 
-    if cns_number:
-        return {
-            "tool": "get_route_by_cns",
-            "data": get_route_by_cns(cns_number)
-        }
 
-    if "customer route summary" in text and customer_id:
-        return {
-            "tool": "get_customer_route_summary",
-            "data": get_customer_route_summary(customer_id)
-        }
+def _build_answer(route, rag_result, database, llm_answer):
+    if route == "both" and isinstance(database, dict) and database.get("records"):
+        db_answer = _build_list_answer(database, "matching record(s)")
+        rag_answer = (rag_result or {}).get("answer")
+        if rag_answer:
+            return f"{db_answer}\n\nDocument summary:\n{rag_answer}"
+        return db_answer
 
-    if customer_id and "route" in text:
-        return {
-            "tool": "get_customer_route_summary",
-            "data": get_customer_route_summary(customer_id)
-        }
+    if route == "database" and isinstance(database, dict) and database.get("records"):
+        entity = "customer(s)"
+        if database.get("tool") == "search_routes_tool":
+            entity = "route(s)"
+        return _build_list_answer(database, entity)
 
-    if customer_id:
-        return {
-            "tool": "get_customer_by_id",
-            "data": get_customer_by_id(customer_id)
-        }
+    if route == "rag" and isinstance(rag_result, dict):
+        return rag_result.get("answer") or llm_answer
 
-    if route_id:
-        return {
-            "tool": "get_route_by_id",
-            "data": get_route_by_id(route_id)
-        }
+    if route == "database" and isinstance(database, dict) and database.get("record"):
+        record = database["record"]
+        if isinstance(record, dict) and record.get("customer_name"):
+            return (
+                f"Customer {record['customer_name']} (ID: {record.get('id')}) "
+                f"from branch {record.get('cust_main_branch')}."
+            )
+        return llm_answer
 
-    if "top cost" in text or "highest cost" in text or "costly" in text or "maximum cost" in text:
-        return {
-            "tool": "get_top_cost_routes",
-            "data": get_top_cost_routes(10)
-        }
+    return llm_answer
 
-    if "top distance" in text or "highest distance" in text or "maximum km" in text or "longest" in text:
-        return {
-            "tool": "get_top_distance_routes",
-            "data": get_top_distance_routes(10)
-        }
 
-    if "city summary" in text or "city wise" in text or "city-wise" in text:
-        return {
-            "tool": "get_city_route_summary",
-            "data": get_city_route_summary()
-        }
-
-    if "branch summary" in text or "branch wise" in text or "branch-wise" in text:
-        return {
-            "tool": "get_customer_branch_summary",
-            "data": get_customer_branch_summary()
-        }
-
-    if "customer summary" in text or "total customers" in text:
-        return {
-            "tool": "get_customer_summary",
-            "data": get_customer_summary()
-        }
-
-    if "route summary" in text or "total routes" in text or "route performance" in text:
-        return {
-            "tool": "get_route_summary",
-            "data": get_route_summary()
-        }
-
-    if vehicle_no:
-        return {
-            "tool": "search_routes",
-            "data": search_routes(vehicle_no=vehicle_no, limit=10)
-        }
-
-    if driver_id:
-        return {
-            "tool": "search_routes",
-            "data": search_routes(driver_id=driver_id, limit=10)
-        }
-
-    if from_city or to_city:
-        return {
-            "tool": "search_routes",
-            "data": search_routes(from_city=from_city, to_city=to_city, limit=10)
-        }
-
-    return {
-        "tool": "get_route_summary",
-        "data": get_route_summary()
-    }
-
-def generate_final_answer(message, rag_result=None, mcp_result=None):
-    prompt = f"""
-You are a logistics AI assistant.
-
-User question:
-{message}
-
-RAG document result:
-{rag_result}
-
-MCP MySQL result:
-{mcp_result}
-
-Instructions:
-1. Answer in simple professional English.
-2. Use RAG result for policy, SOP, document, or process-related answers.
-3. Use MCP MySQL result for customer, route, CNS, vehicle, driver, cost, distance, and live database answers.
-4. Do not mention SQL query.
-5. Do not say that you updated, inserted, deleted, or changed any database record.
-6. If data is not available, clearly say data is not available.
-7. Keep the answer concise and useful.
-"""
-
-    response = llm.invoke(prompt)
-    return response.content
-
-def ai_chat(message):
-    route = decide_route(message)
-
+def _build_source_results(tool_results, page, limit):
     rag_result = None
-    mcp_result = None
+    database = _refresh_paginated_database(tool_results, page, limit)
+    database_results = []
 
-    if route == "rag":
-        rag_result = ask_rag(message)
+    if not database:
+        for result in tool_results:
+            tool_name = result.get("tool")
+            tool_args = result.get("args") or {}
+            data = result.get("data")
 
-    elif route == "mcp":
-        mcp_result = run_mcp_tools(message)
+            if tool_name == RAG_TOOL_NAME:
+                rag_result = data
+            elif tool_name in MCP_TOOL_NAMES:
+                database_results.append(
+                    _normalize_database_result(tool_name, tool_args, data)
+                )
 
+        if len(database_results) == 1:
+            database = database_results[0]
+        elif len(database_results) > 1:
+            database = database_results
     else:
-        rag_result = ask_rag(message)
-        mcp_result = run_mcp_tools(message)
+        for result in tool_results:
+            if result.get("tool") == RAG_TOOL_NAME:
+                rag_result = result.get("data")
+                break
 
-    answer = generate_final_answer(
-        message=message,
-        rag_result=rag_result,
-        mcp_result=mcp_result
+    route = "agent"
+    if rag_result and database:
+        route = "both"
+    elif rag_result:
+        route = "rag"
+    elif database:
+        route = "database"
+
+    return route, rag_result, database
+
+
+def _build_success_message(route, database):
+    if route == "both":
+        return "Request completed successfully using documents and database data."
+    if route == "database":
+        total = 0
+        if isinstance(database, dict):
+            total = database.get("row_count", 0)
+        return f"Request completed successfully. Found {total} matching database record(s)."
+    if route == "rag":
+        return "Request completed successfully using uploaded documents."
+    return "Request completed successfully."
+
+
+def _build_client_data(answer, route, rag_result, database):
+    data = {"answer": answer}
+
+    if isinstance(database, dict):
+        if database.get("records") is not None:
+            data["records"] = database["records"]
+        elif database.get("record"):
+            data["record"] = database["record"]
+
+    if rag_result and route in ("rag", "both"):
+        sources = rag_result.get("sources")
+        if sources:
+            data["sources"] = sources
+
+    return data
+
+
+def _build_client_meta(database, debug=False, tool_results=None):
+    meta = {}
+
+    if isinstance(database, dict) and database.get("pagination"):
+        meta["pagination"] = database["pagination"]
+
+    if debug and tool_results is not None:
+        meta["tool_results"] = tool_results
+
+    return meta
+
+
+def ai_chat(message, page=DEFAULT_PAGE, limit=DEFAULT_LIMIT, debug=False):
+    try:
+        page, limit = _normalize_pagination(page, limit)
+    except ValueError as exc:
+        return error_response(
+            message="Invalid pagination parameters.",
+            code="VALIDATION_ERROR",
+            details=str(exc),
+            status_code=400,
+        )
+
+    agent = get_agent()
+    agent_message = _build_agent_message(message, page, limit)
+
+    try:
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=agent_message)]},
+            config={"recursion_limit": MAX_AGENT_STEPS},
+        )
+    except Exception as exc:
+        return error_response(
+            message="AI service failed to process the request.",
+            code="AGENT_ERROR",
+            details=str(exc),
+            status_code=500,
+        )
+
+    messages = result.get("messages", [])
+    tool_results, _tools_used = _extract_tool_trace(messages)
+    route, rag_result, database = _build_source_results(tool_results, page, limit)
+    llm_answer = _extract_final_answer(messages)
+    answer = _build_answer(route, rag_result, database, llm_answer)
+
+    data = _build_client_data(answer, route, rag_result, database)
+    meta = _build_client_meta(database, debug=debug, tool_results=tool_results)
+
+    return success_response(
+        message=_build_success_message(route, database),
+        data=data,
+        meta=meta,
+        status_code=200,
     )
-
-    return {
-        "route": route,
-        "answer": answer,
-        "rag_result": rag_result,
-        "mcp_result": mcp_result
-    }
